@@ -1,3 +1,3 @@
 @echo off
-node "%~dp0unlock.js" %*
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0unlock-core.ps1" %*
 exit /b %errorlevel%

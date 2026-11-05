@@ -1,94 +1,118 @@
-﻿$ErrorActionPreference = 'Stop'
-$root = Split-Path $PSScriptRoot -Parent
+﻿param([switch]$Library)
+$ErrorActionPreference = 'Stop'
 
-function Find-Node {
-    $command = Get-Command node.exe -ErrorAction SilentlyContinue
-    $candidates = @(
-        $(if ($command) { $command.Source }),
-        "$env:ProgramFiles\nodejs\node.exe",
-        "${env:ProgramFiles(x86)}\nodejs\node.exe",
-        "$env:LOCALAPPDATA\Programs\nodejs\node.exe"
-    )
-    foreach ($candidate in $candidates) {
-        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
-            & $candidate -e 'process.exit(Number(process.versions.node.split(String.fromCharCode(46))[0]) >= 18 ? 0 : 1)' | Out-Null
-            if ($LASTEXITCODE -eq 0) { return $candidate }
+function Read-UnlockScript([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 2MB) { return '' }
+    try { [IO.File]::ReadAllText($Path) } catch { '' }
+}
+
+function Get-UnlockCleanupPlan([string]$Prefix, [string]$Destination, [string]$Source) {
+    $prefix = [IO.Path]::GetFullPath($Prefix).TrimEnd('\')
+    $destination = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
+    $source = [IO.Path]::GetFullPath($Source).TrimEnd('\')
+    $files = New-Object 'System.Collections.Generic.List[object]'
+    $plan = [pscustomobject]@{Prefix=$prefix; Files=$files; Package=$null}
+    if ($prefix -ieq $source -or -not (Test-Path -LiteralPath $prefix -PathType Container)) { return $plan }
+    if ((Get-Item -LiteralPath $prefix -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $plan }
+    $js = Read-UnlockScript (Join-Path $prefix 'unlock.js')
+    $core = Read-UnlockScript (Join-Path $prefix 'unlock-core.ps1')
+    $oursJS = $js.Contains('function findEncryptedFiles(') -and $js.Contains('async function unlockInPlace(')
+    $oursPS = $core.Contains('namespace UnlockPortable') -and $core.Contains('class EngineV2')
+
+    $packageRoot = Join-Path $prefix 'node_modules\@zlhy7\ld-decrypt-tool'
+    $linked = $false
+    foreach ($relative in @('node_modules','node_modules\@zlhy7','node_modules\@zlhy7\ld-decrypt-tool')) {
+        $p = Join-Path $prefix $relative
+        if ((Test-Path -LiteralPath $p) -and ((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { $linked = $true }
+    }
+    if (-not $linked -and $prefix -ine $destination) {
+        $manifest = Read-UnlockScript (Join-Path $packageRoot 'package.json')
+        if ($manifest) {
+            try { if (($manifest | ConvertFrom-Json).name -ceq '@zlhy7/ld-decrypt-tool') { $plan.Package = '@zlhy7/ld-decrypt-tool' } } catch { }
         }
+    }
+    foreach ($name in @('unlock.js','unlock-core.ps1','unlock.cmd','unlock.ps1','unlock')) {
+        if ($prefix -ieq $destination -and $name -ne 'unlock.js') { continue }
+        $p = Join-Path $prefix $name
+        $text = Read-UnlockScript $p
+        $owned = ($name -eq 'unlock.js' -and $oursJS) -or ($name -eq 'unlock-core.ps1' -and $oursPS)
+        if ($name -in @('unlock.cmd','unlock.ps1','unlock')) {
+            $owned = ($oursJS -and $text.Contains('unlock.js')) -or ($oursPS -and $text.Contains('unlock-core.ps1')) -or
+                ($plan.Package -and $text -match '@zlhy7[\\/]ld-decrypt-tool[\\/]bin[\\/]unlock\.js')
+        }
+        if ($owned -and $text) { $files.Add([pscustomobject]@{Path=$p; Hash=(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash}) }
+    }
+    return $plan
+}
+
+function Remove-UnlockOldVersion($Plan) {
+    if ($Plan.Package) {
+        $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+        if ($npm) {
+            Write-Host "Removing old unlock package only: $($Plan.Prefix)"
+            & $npm.Source uninstall -g --prefix $Plan.Prefix --ignore-scripts --no-audit --no-fund $Plan.Package
+            if ($LASTEXITCODE -ne 0) { Write-Warning 'Old unlock package removal failed; Node.js and npm were NOT uninstalled.' }
+        } else { Write-Warning 'Old unlock npm package retained: npm is unavailable. No software was uninstalled.' }
+    }
+    foreach ($file in $Plan.Files) {
+        if (-not (Test-Path -LiteralPath $file.Path -PathType Leaf)) { continue }
+        $item = Get-Item -LiteralPath $file.Path -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or (Get-FileHash -LiteralPath $file.Path -Algorithm SHA256).Hash -ne $file.Hash) {
+            Write-Warning "Changed or linked item retained: $($file.Path)"
+            continue
+        }
+        try { Remove-Item -LiteralPath $file.Path -ErrorAction Stop; Write-Host "Removed old unlock script: $($file.Path)" }
+        catch { Write-Warning "Old unlock script retained: $($file.Path) -- $($_.Exception.Message)" }
     }
 }
 
+if ($Library) { return }
 try {
+    $root = Split-Path $PSScriptRoot -Parent
     $src = Join-Path $root 'bin'
-    foreach ($name in @('unlock.js', 'unlock.cmd')) {
-        if (-not (Test-Path -LiteralPath (Join-Path $src $name) -PathType Leaf)) {
-            throw "Missing file: bin\$name"
-        }
+    foreach ($name in @('unlock-core.ps1', 'unlock.cmd')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $src $name) -PathType Leaf)) { throw "Missing file: bin\$name" }
     }
+    # Verify the new engine before overwriting any installed entry points.
+    $probe = Join-Path $src 'unlock-core.ps1'
+    & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $probe -Library
+    if ($LASTEXITCODE -ne 0) { throw 'PowerShell/.NET validation failed. No installation performed.' }
 
-    Write-Host 'Checking Node.js...'
-    $node = Find-Node
-    if (-not $node) {
-        $downloadDir = $null
-        try {
-            try {
-                Write-Host 'Downloading official Node.js LTS using PowerShell...'
-                [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-                $releases = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -TimeoutSec 30
-                $release = $releases | Where-Object { $_.lts -and $_.files -contains 'win-x64-msi' } | Select-Object -First 1
-                if (-not $release) { throw 'No Windows x64 LTS release found.' }
-                $name = "node-$($release.version)-x64.msi"
-                $url = "https://nodejs.org/dist/$($release.version)"
-                $downloadDir = Join-Path ([IO.Path]::GetTempPath()) ('unlock-node-' + [guid]::NewGuid().ToString('N'))
-                New-Item -ItemType Directory -Path $downloadDir | Out-Null
-                $msiPath = Join-Path $downloadDir $name
-                Invoke-WebRequest -UseBasicParsing -Uri "$url/$name" -OutFile $msiPath -TimeoutSec 300
-                $sums = (Invoke-WebRequest -UseBasicParsing -Uri "$url/SHASUMS256.txt" -TimeoutSec 30).Content
-                $line = $sums -split "`n" | Where-Object { $_.Trim().EndsWith(" $name") } | Select-Object -First 1
-                if (-not $line) { throw 'Official checksum not found.' }
-                $expected = ($line.Trim() -split '\s+')[0]
-                if ((Get-FileHash -LiteralPath $msiPath -Algorithm SHA256).Hash -ne $expected) { throw 'Installer checksum mismatch.' }
-            } catch {
-                Write-Warning ('Download unavailable: ' + $_.Exception.Message)
-                $msi = Get-ChildItem -LiteralPath (Join-Path $root 'installers') -Filter 'node-*-x64.msi' -File | Select-Object -First 1
-                if (-not $msi) { throw 'No offline installer found. Check the internet connection and retry.' }
-                $msiPath = $msi.FullName
-                Write-Host 'Using bundled offline installer.'
-            }
-            Write-Host 'Installing Node.js. Accept the Windows administrator prompt if shown.'
-            $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList ('/i "' + $msiPath + '" /passive /norestart') -Wait -PassThru
-            if ($process.ExitCode -notin @(0, 3010, 1641)) { throw "Node.js installer exited with code $($process.ExitCode)." }
-            $node = Find-Node
-        } finally {
-            if ($downloadDir -and (Test-Path -LiteralPath $downloadDir)) {
-                Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-        if (-not $node) { throw 'Node.js not detected. Restart Windows if requested, then run this BAT again.' }
-    }
-
-    & $node --check (Join-Path $src 'unlock.js')
-    if ($LASTEXITCODE -ne 0) { throw 'JavaScript validation failed.' }
     $dst = Join-Path $env:LOCALAPPDATA 'Programs\unlock-cli'
-    New-Item -ItemType Directory -Path $dst -Force | Out-Null
-    foreach ($name in @('unlock.js', 'unlock.cmd')) {
-        Copy-Item -LiteralPath (Join-Path $src $name) -Destination (Join-Path $dst $name) -Force
+    $legacy = Join-Path $env:APPDATA 'npm'
+    $prefixes = @($dst, $legacy)
+    foreach ($command in @(Get-Command unlock.cmd, unlock.ps1 -All -ErrorAction SilentlyContinue)) {
+        if ($command.Source -and (Read-UnlockScript $command.Source) -match '@zlhy7[\\/]ld-decrypt-tool[\\/]bin[\\/]unlock\.js') {
+            $prefixes += Split-Path $command.Source -Parent
+        }
     }
+    $plans = @()
+    foreach ($prefix in @($prefixes | Select-Object -Unique)) { $plans += Get-UnlockCleanupPlan $prefix $dst $src }
+    New-Item -ItemType Directory -Path $dst -Force | Out-Null
+    foreach ($name in @('unlock-core.ps1', 'unlock.cmd')) {
+        $from = Join-Path $src $name
+        $to = Join-Path $dst $name
+        if ([IO.Path]::GetFullPath($from) -ine [IO.Path]::GetFullPath($to)) { Copy-Item -LiteralPath $from -Destination $to -Force }
+    }
+    & (Join-Path $dst 'unlock.cmd') -Help
+    if ($LASTEXITCODE -ne 0) { throw 'New command verification failed.' }
 
-    $nodeDir = Split-Path $node -Parent
     $oldPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $entries = @($dst, $nodeDir)
-    $entries += @($oldPath -split ';' | Where-Object { $_ })
+    $entries = @($dst) + @($oldPath -split ';' | Where-Object { $_ })
     $seen = @{}
     $newPath = ($entries | Where-Object {
         $key = $_.TrimEnd('\').ToLowerInvariant()
         if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; $true } else { $false }
     }) -join ';'
     if ($newPath -ne $oldPath) { [Environment]::SetEnvironmentVariable('Path', $newPath, 'User') }
-    $env:Path = "$dst;$nodeDir;$env:Path"
-    & (Join-Path $dst 'unlock.cmd') --help
-    if ($LASTEXITCODE -ne 0) { throw 'Command verification failed.' }
-    Write-Host "Installed: $dst" -ForegroundColor Green
-    Write-Host 'Open a NEW terminal, then run: unlock "D:\folder"'
+    $env:Path = "$dst;$env:Path"
+    # Never clean an old entry point before the new command and PATH are ready.
+    foreach ($plan in $plans) { Remove-UnlockOldVersion $plan }
+    Write-Host "Installed/updated: $dst" -ForegroundColor Green
+    Write-Host 'Old unlock scripts cleaned. Node.js, npm and unrelated software are kept.'
+    Write-Host 'Open a NEW terminal and run: unlock "D:\folder"'
     exit 0
 } catch {
     Write-Host ('Installation failed: ' + $_.Exception.Message) -ForegroundColor Red

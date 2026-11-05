@@ -1,35 +1,74 @@
-unlock 便携版（Windows x64）
+unlock — PowerShell 便携版（Windows PowerShell 5.1）
 
 一、安装
-双击最外层的“安装.bat”。请保留所有子文件夹一起使用。
-
-安装过程：
-1. 已有 Node.js 18 或更新版本：直接跳过 Node.js 安装。
-2. 否则通过 PowerShell 从 Node.js 官网下载 LTS，校验 SHA256 后自动安装。
-3. 下载失败时，使用 installers 中附带的离线安装包。
-4. 安装 unlock，并配置当前用户 PATH。
-
-Node.js 安装可能弹出管理员确认；unlock 本身安装无需管理员权限。
-不依赖 winget，不需要手动下载安装包。下载的临时文件会自动清理。
+双击最外层的“安装.bat”。不需要 Node.js、npm、联网或加密驱动。
+安装到 %LOCALAPPDATA%\Programs\unlock-cli，并自动配置当前用户 PATH。
+安装完成后关闭旧终端，重新打开 PowerShell。
+这一步无需管理员权限，也不会永久修改 PowerShell 执行策略。
 
 二、使用
-安装完成后关闭旧终端，重新打开 PowerShell。
-
-原位解密单个文件：
+解密单个文件，保持原路径和名称：
 unlock "D:\资料\示例.txt"
 
-递归识别文件夹内的加密文件并原位解密：
+递归扫描整个文件夹，原位解密匹配文件：
 unlock "D:\资料"
 
-普通文件在文件夹扫描时跳过。匹配文件会被替换，重要资料请先备份。
-电脑需要具备 Node 能读取明文的环境条件；本工具不提供解密密钥。
+只扫描，不修改任何文件：
+unlock "D:\资料" -ScanOnly
 
-三、文件结构
-安装.bat       双击安装入口
-使用说明.txt   本说明
-bin            unlock.js 和 unlock.cmd
-setup          自动安装脚本
-installers     官方 Node.js Windows x64 离线安装包（已校验 SHA256）
+指定单文件输出路径：
+unlock "D:\资料\示例.docx" "D:\输出.docx"
 
-unlock 安装位置：%LOCALAPPDATA%\Programs\unlock-cli
-如果不安装，可在 bin 文件夹打开终端，运行 .\unlock.cmd "目标路径"。
+指定目录输出路径（只导出匹配的加密文件，保留相对路径）：
+unlock "D:\资料" "D:\输出目录"
+
+不安装也可以：进入 bin 文件夹，运行 .\unlock.cmd "目标路径"。
+
+三、识别与解密
+- 不按后缀筛选；包含隐藏文件和子文件夹，不跟随符号链接/重解析点。
+- 普通文件只读前 26 字节；疑似加密文件再检查前 512 字节及头部 CRC。
+- 支持目前验证的版本 9 / RC4 模式；不固定元数据字段为 25 或 40。
+- 不支持的模式、损坏头部和读取失败会报告，原文件保持不动。
+- 从包头推算密钥，按 512 字节循环密钥流还原正文，不依赖字符频率或授权读取。
+- 分块读写，内存用量不会随文件大小线性增长。
+- 先写同目录唯一临时文件，核验写入长度和 SHA256，再原子替换。
+- 替换失败时不先删除原文件；完整临时结果会保留，错误信息包含其路径。
+- 不覆盖已存在的不同目标文件。批量处理遇到单个失败会继续，最终返回非零退出码。
+- 已解密的普通文件会跳过，可重复运行。
+
+四、注意
+默认原位操作。重要资料请事先备份。
+头部 CRC 不是正文认证；工具无法自动发现任意正文篡改。
+支持已验证的格式/模式，不保证其他软件版本和加密模式适用。
+仍受企业权限、脚本策略和文件系统权限限制；不绕过这些策略。
+PowerShell 通过系统自带 Add-Type/.NET 在内存编译计算逻辑，无需外部开发工具。
+不卸载电脑上已有的 Node.js，也不修改其他程序。
+
+五、文件结构
+安装.bat              双击安装入口
+使用说明.txt          本说明
+bin\unlock.cmd        命令入口
+bin\unlock-core.ps1   全部识别与解密逻辑
+setup\install.ps1     安装和用户 PATH 配置
+
+更新时替换 bin 中的两个文件，再双击安装.bat 即可。
+
+六、从旧版迁移（先把新版 unlock-portable 文件夹放到桌面）
+在 PowerShell 中完整执行：
+
+$setup = Join-Path ([Environment]::GetFolderPath('Desktop')) 'unlock-portable\setup\install.ps1'
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $setup
+if ($LASTEXITCODE -ne 0) { throw 'unlock 安装失败，请查看上方错误' }
+$env:Path = "$env:LOCALAPPDATA\Programs\unlock-cli;$env:Path"
+unlock -Help
+
+不需要手改用户名。安装器会识别并迁移早期便携 JS 版本，不卸载 Node.js。
+
+七、更新策略：清理旧 unlock，保留其他软件
+双击安装.bat，先安装并验证新版、配置 PATH，再清理确认属于旧 unlock 的脚本和入口。
+新版统一安装在 %LOCALAPPDATA%\Programs\unlock-cli，只使用 unlock.cmd 和 unlock-core.ps1。
+会清理旧版 unlock.js、重复的旧 PowerShell 入口以及确认属于本工具的旧命令包装脚本。
+若确认安装过 @zlhy7/ld-decrypt-tool，会用 npm 只移除这个旧 unlock 包，禁用其安装/卸载钩子。
+永远不卸载 Node.js 或 npm，不删除整个 npm 文件夹、不清除其他软件的 PATH。
+不删除桌面部署包、用户备份、未知同名文件或链接目标。
+遇到权限不足、文件被修改或 npm 不可用时，会报告未能清理的部分，不强行删除。
