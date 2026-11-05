@@ -90,10 +90,14 @@ namespace UnlockPortable {
                 info.Kind = "Invalid"; info.Reason = "Truncated encrypted header"; return info;
             }
             // The tested profile. Do not guess an unverified mode or version.
-            if (header[0] != 0x89 || header[2] != 0x1c || header[6] != 0x0f || header[7] != 0) {
-                info.Kind = "Unsupported"; info.Reason = "Unverified encryption version or mode"; return info;
+            if (header[0] != 0x89 || header[2] != 0x1c) {
+                info.Kind = "Unsupported";
+                info.Reason = String.Format("Unverified encryption version/mode (version byte=0x{0:X2}, mode byte=0x{1:X2})", header[0], header[2]);
+                return info;
             }
             // Metadata byte 4 is deliberately not fixed to 0x25/0x40.
+            // Bytes 6..7 are also metadata, not an encryption-mode selector.
+            // Both 0x000f and 0x000d samples have the same verified derivation.
             // The enterprise marker/password index at 20..25 is not a universal magic.
             int more = 512 - count;
             while (more > 0) {

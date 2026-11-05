@@ -2,6 +2,8 @@ unlock — PowerShell 便携版（Windows PowerShell 5.1）
 
 一、安装
 双击最外层的“安装.bat”。不需要 Node.js、npm、联网或加密驱动。
+同一个 BAT 同时支持首次安装和覆盖更新；请先解压完整的最新版部署包。
+BAT 部署的是当前文件夹内的脚本，不会自动联网下载新版本。
 安装到 %LOCALAPPDATA%\Programs\unlock-cli，并自动配置当前用户 PATH。
 安装完成后关闭旧终端，重新打开 PowerShell。
 这一步无需管理员权限，也不会永久修改 PowerShell 执行策略。
@@ -28,6 +30,9 @@ unlock "D:\资料" "D:\输出目录"
 - 不按后缀筛选；包含隐藏文件和子文件夹，不跟随符号链接/重解析点。
 - 普通文件只读前 26 字节；疑似加密文件再检查前 512 字节及头部 CRC。
 - 支持目前验证的版本 9 / RC4 模式；不固定元数据字段为 25 或 40。
+- 元数据 6–7 字节不再写死为 0F 00，已验证 0D 00 的旧 XLS 同样适用。
+- BAT、HTML、DLL、Python、Office 等按内容识别，不按文件后缀设白名单；脚本与 DLL 不会被执行。
+- 解密器保留任意二进制字节，适用于该加密模式下的任意后缀；不转换编码、不解析或运行文件内容。
 - 不支持的模式、损坏头部和读取失败会报告，原文件保持不动。
 - 从包头推算密钥，按 512 字节循环密钥流还原正文，不依赖字符频率或授权读取。
 - 分块读写，内存用量不会随文件大小线性增长。
@@ -35,6 +40,7 @@ unlock "D:\资料" "D:\输出目录"
 - 替换失败时不先删除原文件；完整临时结果会保留，错误信息包含其路径。
 - 不覆盖已存在的不同目标文件。批量处理遇到单个失败会继续，最终返回非零退出码。
 - 已解密的普通文件会跳过，可重复运行。
+- 终端动态进度出现重影时可加 -NoProgress 关闭进度刷新，不影响解密。
 
 四、注意
 默认原位操作。重要资料请事先备份。
@@ -72,3 +78,18 @@ unlock -Help
 永远不卸载 Node.js 或 npm，不删除整个 npm 文件夹、不清除其他软件的 PATH。
 不删除桌面部署包、用户备份、未知同名文件或链接目标。
 遇到权限不足、文件被修改或 npm 不可用时，会报告未能清理的部分，不强行删除。
+
+八、兼容性自测（可选）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\compatibility.ps1
+包含 BAT/HTML/Python/编译生成的 DLL 测试，以及 60 种后缀的任意字节保真测试。
+后缀测试不宣称每个合成文件都是对应格式的有效文档。测试不执行脚本或 DLL 方法。
+
+九、在线安装/更新（无需提前下载部署包）
+在 PowerShell 中运行下面一整行，仅在信任该 GitHub 仓库时执行：
+
+(Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/ZUOBIEXIAN/unlock-portable/main/setup/update.ps1').Content | Invoke-Expression
+
+自动下载同一份完整的最新版部署包，安装/更新命令，清理确认的旧 unlock，校验安装文件并删除下载临时目录。
+不需要 Node.js，不卸载已有 Node.js/npm，不改动用户文档。首次安装和后续更新使用同一条指令。
+完成后当前 PowerShell 可以直接使用 unlock；新终端也会通过用户 PATH 找到命令。
+需要能够访问 GitHub。代理、企业策略或权限限制导致失败时，会明确报错。
