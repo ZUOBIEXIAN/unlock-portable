@@ -37,7 +37,7 @@ function findEncryptedFiles(dir) {
     '  $b = New-Object byte[] 26',
     '  $stream = [IO.File]::OpenRead($_.FullName)',
     '  $n = $stream.Read($b, 0, 26)',
-    '  if ($n -eq 26 -and $b[0] -eq 0x89 -and $b[1] -eq 0x7D -and $b[2] -eq 0x1C -and $b[4] -eq 0x25 -and $b[5] -eq 0x00 -and $b[6] -eq 0x0F -and $b[7] -eq 0x00 -and $b[20] -eq 0xC4 -and $b[21] -eq 0x6C -and $b[22] -eq 0x14 -and $b[23] -eq 0x06 -and $b[24] -eq 0xFE -and $b[25] -eq 0xFF) { $_.FullName }',
+    '  if ($n -eq 26 -and $b[0] -eq 0x89 -and $b[1] -eq 0x7D -and $b[2] -eq 0x1C -and ($b[4] -eq 0x25 -or $b[4] -eq 0x40) -and $b[5] -eq 0x00 -and $b[6] -eq 0x0F -and $b[7] -eq 0x00 -and $b[20] -eq 0xC4 -and $b[21] -eq 0x6C -and $b[22] -eq 0x14 -and $b[23] -eq 0x06 -and $b[24] -eq 0xFE -and $b[25] -eq 0xFF) { $_.FullName }',
     '  } catch { [Console]::Error.WriteLine("读取失败: " + $_.Exception.Message) }',
     '  finally { if ($null -ne $stream) { $stream.Dispose() } }',
     '})',
