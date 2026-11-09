@@ -37,7 +37,11 @@ if (-not ('UnlockPortable.EngineV2' -as [type])) {
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Collections.Generic;
 using System.Security.Cryptography;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace UnlockPortable {
     public sealed class HeaderInfo {
@@ -82,17 +86,17 @@ namespace UnlockPortable {
         static HeaderInfo InspectStream(FileStream stream, out byte[] header) {
             header = new byte[512];
             long length = stream.Length;
-            HeaderInfo info = new HeaderInfo {Kind = "Plain", Reason = "No encrypted header", FileBytes = length};
+            HeaderInfo info = new HeaderInfo {Kind = "Plain", Reason = "未发现加密头", FileBytes = length};
             int count = ReadUpTo(stream, header, 26);
             // Magic family 0x7d8?. Do not treat an arbitrary binary extension as encrypted.
             if (count < 2 || (header[0] & 0xf0) != 0x80 || header[1] != 0x7d) return info;
             if (count < 26 || length < HeaderSize) {
-                info.Kind = "Invalid"; info.Reason = "Truncated encrypted header"; return info;
+                info.Kind = "Invalid"; info.Reason = "加密头不完整"; return info;
             }
             // The tested profile. Do not guess an unverified mode or version.
             if (header[0] != 0x89 || header[2] != 0x1c) {
                 info.Kind = "Unsupported";
-                info.Reason = String.Format("Unverified encryption version/mode (version byte=0x{0:X2}, mode byte=0x{1:X2})", header[0], header[2]);
+                info.Reason = String.Format("不支持的加密版本或模式（版本字节 0x{0:X2}，模式字节 0x{1:X2}）", header[0], header[2]);
                 return info;
             }
             // Metadata byte 4 is deliberately not fixed to 0x25/0x40.
@@ -106,9 +110,9 @@ namespace UnlockPortable {
                 count += read; more -= read;
             }
             if (count != 512 || HeaderCRC(header) != header[46]) {
-                info.Kind = "Invalid"; info.Reason = "Encrypted header CRC mismatch"; return info;
+                info.Kind = "Invalid"; info.Reason = "加密头 CRC 校验失败"; return info;
             }
-            info.Kind = "Supported"; info.Reason = "Version 9 / verified RC4 profile";
+            info.Kind = "Supported"; info.Reason = "版本 9 / 已验证的 RC4 格式";
             return info;
         }
 
@@ -168,8 +172,8 @@ namespace UnlockPortable {
             source = Path.GetFullPath(source);
             destination = Path.GetFullPath(destination);
             bool inPlace = String.Equals(source, destination, StringComparison.OrdinalIgnoreCase);
-            if ((File.GetAttributes(source) & FileAttributes.ReparsePoint) != 0) throw new IOException("Links/reparse points are not processed");
-            if (!inPlace && (File.Exists(destination) || Directory.Exists(destination))) throw new IOException("Output already exists; refusing to overwrite: " + destination);
+            if ((File.GetAttributes(source) & FileAttributes.ReparsePoint) != 0) throw new IOException("不处理符号链接或重解析点");
+            if (!inPlace && (File.Exists(destination) || Directory.Exists(destination))) throw new IOException("输出文件已存在，拒绝覆盖：" + destination);
             string parent = Path.GetDirectoryName(destination);
             Directory.CreateDirectory(parent);
             string temporary = Path.Combine(parent, "unlock_" + Guid.NewGuid().ToString("N") + "_" + Path.GetFileName(destination) + ".tmp");
@@ -185,7 +189,7 @@ namespace UnlockPortable {
                     originalLength = input.Length;
                     byte[] header;
                     HeaderInfo info = InspectStream(input, out header);
-                    if (info.Kind != "Supported") throw new InvalidDataException(info.Kind + ": " + info.Reason);
+                    if (info.Kind != "Supported") throw new InvalidDataException(info.Reason);
                     stream = KeyStream(header);
                     long expected = originalLength - HeaderSize;
                     input.Position = HeaderSize;
@@ -205,16 +209,16 @@ namespace UnlockPortable {
                         sha.TransformFinalBlock(new byte[0], 0, 0);
                         digest = Hex(sha.Hash);
                         output.Flush(true);
-                        if (plainBytes != expected) throw new IOException("Source length changed while reading");
+                        if (plainBytes != expected) throw new IOException("读取期间原文件长度发生变化");
                         if (progress != null) progress(plainBytes, expected);
                     }
                 }
                 using (SHA256 sha = SHA256.Create())
                 using (FileStream check = new FileStream(temporary, FileMode.Open, FileAccess.Read, FileShare.Read)) {
-                    if (check.Length != plainBytes || Hex(sha.ComputeHash(check)) != digest) throw new IOException("Temporary output verification failed");
+                    if (check.Length != plainBytes || Hex(sha.ComputeHash(check)) != digest) throw new IOException("临时输出校验失败");
                 }
                 if (new FileInfo(source).Length != originalLength || File.GetLastWriteTimeUtc(source) != originalWrite) {
-                    throw new IOException("Source changed before replacement");
+                    throw new IOException("替换前原文件已发生变化");
                 }
                 if (inPlace) {
                     // Atomic replacement, not delete-then-rename. Failure preserves the source.
@@ -238,6 +242,104 @@ namespace UnlockPortable {
                 }
             }
         }
+
+        static T WithReadablePath<T>(string path, Func<string, T> action) {
+            if (!String.Equals(Path.GetExtension(path), ".ps1", StringComparison.OrdinalIgnoreCase)) return action(path);
+            string directory = Path.GetDirectoryName(path);
+            string name = Path.GetFileName(path);
+            string temporaryName = Path.GetFileNameWithoutExtension(name) + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".txt";
+            string temporary = Path.Combine(directory, temporaryName);
+            File.Move(path, temporary);
+            try {
+                return action(temporary);
+            } finally {
+                try { File.Move(temporary, path); }
+                catch (Exception ex) { throw new IOException("无法自动改回 .ps1 名称，请手动把 " + temporary + " 改回 " + name + "：" + ex.Message, ex); }
+            }
+        }
+
+        public static ScanResult Scan(string root, Action<int> progress) {
+            ScanResult result = new ScanResult();
+            Regex temporaryPattern = new Regex("^unlock_[0-9a-f]{32}_.+\\.tmp$", RegexOptions.IgnoreCase);
+            Stack<string> pending = new Stack<string>();
+            int visited = 0;
+            pending.Push(root);
+            while (pending.Count > 0) {
+                string directory = pending.Pop();
+                string[] entries;
+                try { entries = Directory.GetFileSystemEntries(directory); }
+                catch (Exception ex) { result.Errors++; result.Issues.Add("目录读取失败：" + directory + " — " + ex.GetBaseException().Message); continue; }
+                foreach (string entry in entries) {
+                    FileAttributes attributes;
+                    try { attributes = File.GetAttributes(entry); }
+                    catch (Exception ex) { result.Errors++; result.Issues.Add("读取失败：" + entry + " — " + ex.GetBaseException().Message); continue; }
+                    visited++;
+                    if (progress != null && visited % 50 == 0) progress(visited);
+                    if ((attributes & FileAttributes.ReparsePoint) != 0) { result.Links++; continue; }
+                    if ((attributes & FileAttributes.Directory) != 0) { pending.Push(entry); continue; }
+                    if (temporaryPattern.IsMatch(Path.GetFileName(entry))) continue;
+                    result.Scanned++;
+                    try {
+                        HeaderInfo info = WithReadablePath(entry, p => Inspect(p));
+                        switch (info.Kind) {
+                            case "Supported": result.Files.Add(entry); break;
+                            case "Plain": result.Plain++; break;
+                            case "Invalid": result.Invalid++; result.Issues.Add("损坏或不完整：" + entry + " — " + info.Reason); break;
+                            case "Unsupported": result.Unsupported++; result.Issues.Add("暂不支持：" + entry + " — " + info.Reason); break;
+                        }
+                    } catch (Exception ex) { result.Errors++; result.Issues.Add("读取失败：" + entry + " — " + ex.GetBaseException().Message); }
+                }
+            }
+            return result;
+        }
+
+        public static BatchJob StartBatch(string[] sources, string[] targets, int workers) {
+            BatchJob job = new BatchJob {Total = sources.Length};
+            job.Task = Task.Run(() => DecryptBatch(sources, targets, workers, job));
+            return job;
+        }
+
+        static BatchResult[] DecryptBatch(string[] sources, string[] targets, int workers, BatchJob job) {
+            BatchResult[] results = new BatchResult[sources.Length];
+            Parallel.For(0, sources.Length, new ParallelOptions {MaxDegreeOfParallelism = workers}, i => {
+                BatchResult item = new BatchResult {Source = sources[i]};
+                try {
+                    bool inPlace = String.Equals(sources[i], targets[i], StringComparison.OrdinalIgnoreCase);
+                    DecryptResult done = WithReadablePath(sources[i], readable => DecryptFile(readable, inPlace ? readable : targets[i], null));
+                    item.Ok = true;
+                    item.PlainBytes = done.PlainBytes;
+                } catch (Exception ex) {
+                    item.Error = ex.GetBaseException().Message;
+                }
+                results[i] = item;
+                Interlocked.Increment(ref job.Done);
+            });
+            return results;
+        }
+    }
+
+    public sealed class ScanResult {
+        public List<string> Files = new List<string>();
+        public List<string> Issues = new List<string>();
+        public int Scanned;
+        public int Plain;
+        public int Invalid;
+        public int Unsupported;
+        public int Links;
+        public int Errors;
+    }
+
+    public sealed class BatchJob {
+        public int Total;
+        public int Done;
+        public Task<BatchResult[]> Task;
+    }
+
+    public sealed class BatchResult {
+        public string Source;
+        public bool Ok;
+        public long PlainBytes;
+        public string Error;
     }
 }
 '@
@@ -257,39 +359,37 @@ function Invoke-WithReadablePath([string]$Path, [scriptblock]$Action) {
     }
 }
 
+function Show-Bar([string]$Label, [long]$Done, [long]$Total) {
+    $width = 32
+    $ratio = if ($Total -gt 0) { [Math]::Min(1.0, [double]$Done / $Total) } else { 0.0 }
+    $filled = [int][Math]::Floor($ratio * $width)
+    $fill = if ($ratio -lt 0.34) { 'Red' } elseif ($ratio -lt 0.7) { 'Yellow' } else { 'Green' }
+    $percent = [int][Math]::Floor($ratio * 100)
+    Write-Host "`r$Label " -NoNewline -ForegroundColor Cyan
+    Write-Host ('█' * $filled) -NoNewline -ForegroundColor $fill
+    Write-Host ('░' * ($width - $filled)) -NoNewline -ForegroundColor DarkGray
+    Write-Host (' {0,3}%  {1}/{2}          ' -f $percent, $Done, $Total) -NoNewline -ForegroundColor White
+}
+
 function Find-UnlockFiles([string]$Root) {
-    $found = New-Object 'System.Collections.Generic.List[string]'
-    $issues = New-Object 'System.Collections.Generic.List[string]'
-    $pending = New-Object 'System.Collections.Generic.Stack[string]'
-    $pending.Push($Root)
-    $scanned = 0; $plain = 0; $invalid = 0; $unsupported = 0; $links = 0; $errors = 0
-    $clock = [Diagnostics.Stopwatch]::StartNew()
-    while ($pending.Count -gt 0) {
-        $directory = $pending.Pop()
-        try { $entries = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop) }
-        catch { $errors++; $issues.Add("目录读取失败：$directory — $($_.Exception.Message)"); continue }
-        foreach ($entry in $entries) {
-            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { $links++; continue }
-            if ($entry.PSIsContainer) { $pending.Push($entry.FullName); continue }
-            if ($entry.Name -match '^unlock_[0-9a-f]{32}_.+\.tmp$') { continue }
-            $scanned++
-            try {
-                $info = Invoke-WithReadablePath $entry.FullName { param($p) [UnlockPortable.EngineV2]::Inspect($p) }
-                switch ($info.Kind) {
-                    'Supported' { $found.Add($entry.FullName) }
-                    'Plain' { $plain++ }
-                    'Invalid' { $invalid++; $issues.Add("损坏或不完整：$($entry.FullName) — $($info.Reason)") }
-                    'Unsupported' { $unsupported++; $issues.Add("暂不支持：$($entry.FullName) — $($info.Reason)") }
-                }
-            } catch { $errors++; $issues.Add("读取失败：$($entry.FullName) — $($_.Exception.GetBaseException().Message)") }
-            if (-not $NoProgress -and $clock.ElapsedMilliseconds -ge 150) {
-                Write-Progress -Id 1 -Activity '正在识别加密文件' -Status "已检查 $scanned 个文件，匹配 $($found.Count) 个" -CurrentOperation $entry.FullName
-                $clock.Restart()
-            }
-        }
-    }
-    if (-not $NoProgress) { Write-Progress -Id 1 -Activity '正在识别加密文件' -Completed }
-    [pscustomobject]@{Files=$found; Issues=$issues; Scanned=$scanned; Plain=$plain; Invalid=$invalid; Unsupported=$unsupported; Links=$links; Errors=$errors}
+    $script:scanTotal = 0
+    try { $script:scanTotal = @([IO.Directory]::GetFiles($Root, '*', [IO.SearchOption]::AllDirectories)).Count } catch { $script:scanTotal = 0 }
+    $report = $null
+    if (-not $NoProgress) { $report = [Action[int]]{ param($n) Show-Bar '扫描' $n $script:scanTotal } }
+    $result = [UnlockPortable.EngineV2]::Scan($Root, $report)
+    if (-not $NoProgress) { Show-Bar '扫描' $script:scanTotal $script:scanTotal; Write-Host '' }
+    $result
+}
+
+function Show-Failures($Failures) {
+    if ($Failures.Count -eq 0) { return }
+    Write-Host '失败明细：' -ForegroundColor Red
+    foreach ($item in $Failures) { Write-Host "  $item" -ForegroundColor Red }
+}
+
+function Show-Report([int]$Success, [int]$Failed, [double]$Seconds, $Failures) {
+    Write-Host "解密完成：成功 $Success 个，失败 $Failed 个，用时 $([Math]::Round($Seconds, 1)) 秒" -ForegroundColor Cyan
+    Show-Failures $Failures
 }
 
 if ($Library) { return }
@@ -303,15 +403,16 @@ try {
     if ($DestinationPath) { $destination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DestinationPath) }
     $files = New-Object 'System.Collections.Generic.List[string]'
     $failed = 0
+    $failures = New-Object 'System.Collections.Generic.List[string]'
     if ($sourceItem.PSIsContainer) {
         if ($destination -and $destination.TrimEnd('\') -ieq $source.TrimEnd('\')) { $destination = $null }
         if ($destination -and $destination.StartsWith($source.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw '输出目录不能放在源目录内部。' }
-        Write-Host '正在扫描文件头（普通文件只读前 26 字节，疑似加密文件校验前 512 字节）…'
+        $scanStopwatch = [Diagnostics.Stopwatch]::StartNew()
         $scan = Find-UnlockFiles $source
         $files = $scan.Files
         $failed = $scan.Invalid + $scan.Unsupported + $scan.Errors
-        Write-Host "已扫描 $($scan.Scanned) 个：匹配 $($files.Count)，普通文件 $($scan.Plain)，损坏 $($scan.Invalid)，不支持 $($scan.Unsupported)，读取失败 $($scan.Errors)，跳过链接 $($scan.Links)"
-        foreach ($issue in $scan.Issues) { Write-Warning $issue }
+        foreach ($issue in $scan.Issues) { $failures.Add($issue) }
+        Write-Host "扫描完成：已扫描 $($scan.Scanned) 个，匹配 $($files.Count) 个，普通文件 $($scan.Plain) 个，用时 $([Math]::Round($scanStopwatch.Elapsed.TotalSeconds, 1)) 秒"
     } else {
         $info = Invoke-WithReadablePath $source { param($p) [UnlockPortable.EngineV2]::Inspect($p) }
         if ($info.Kind -eq 'Plain') { Write-Host '跳过：文件没有支持的加密包头。'; exit 0 }
@@ -320,9 +421,35 @@ try {
     }
     if ($ScanOnly) {
         foreach ($file in $files) { Write-Output $file }
+        Show-Failures $failures
         if ($failed) { exit 1 }; exit 0
     }
-    $success = 0; $index = 0
+    if ($sourceItem.PSIsContainer) {
+        $targets = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($file in $files) {
+            if ($destination) { $targets.Add((Join-Path $destination $file.Substring($source.TrimEnd('\').Length + 1))) }
+            else { $targets.Add($file) }
+        }
+        $workers = [Math]::Max(1, [Math]::Min(4, [Environment]::ProcessorCount))
+        $batchStopwatch = [Diagnostics.Stopwatch]::StartNew()
+        $job = [UnlockPortable.EngineV2]::StartBatch([string[]]$files.ToArray(), [string[]]$targets.ToArray(), $workers)
+        while (-not $job.Task.IsCompleted) {
+            if (-not $NoProgress) { Show-Bar '解密' $job.Done $job.Total }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not $NoProgress) { Show-Bar '解密' $job.Total $job.Total; Write-Host '' }
+        $outcomes = $job.Task.Result
+        $success = 0
+        foreach ($outcome in $outcomes) {
+            if ($outcome.Ok) { $success++ }
+            else { $failed++; $failures.Add("$($outcome.Source) — $($outcome.Error)") }
+        }
+        Show-Report $success $failed $batchStopwatch.Elapsed.TotalSeconds $failures
+        if ($failed) { exit 1 }
+        exit 0
+    }
+    $success = 0
+    $decryptStopwatch = [Diagnostics.Stopwatch]::StartNew()
     foreach ($file in $files) {
         $target = $file
         if ($destination) {
@@ -330,31 +457,21 @@ try {
             else { $target = $destination }
         }
         $progress = $null
-        if (-not $NoProgress) {
-            $progress = [Action[long,long]]{
-                param($done, $total)
-                $fraction = 1.0
-                if ($total -gt 0) { $fraction = [double]$done / $total }
-                $percent = [int](100 * ($index + $fraction) / [Math]::Max(1, $files.Count))
-                Write-Progress -Id 1 -Activity '正在解密' -Status "[$($index + 1)/$($files.Count)] $([IO.Path]::GetFileName($file)) — $done / $total 字节" -PercentComplete ([Math]::Min(100, $percent)) -CurrentOperation $file
-            }
-        }
+        if (-not $NoProgress) { $progress = [Action[long,long]]{ param($d, $t) Show-Bar '解密' $d $t } }
         try {
             $result = Invoke-WithReadablePath $file { param($p) $output = if ($target -ieq $file) { $p } else { $target }; [UnlockPortable.EngineV2]::DecryptFile($p, $output, $progress) }
+            if (-not $NoProgress) { Show-Bar '解密' $result.PlainBytes $result.PlainBytes; Write-Host '' }
             $success++
-            if (-not $sourceItem.PSIsContainer) { Write-Host "已解密：$($result.Destination)（$($result.PlainBytes) 字节）" -ForegroundColor Cyan }
         } catch {
+            if (-not $NoProgress) { Write-Host '' }
             $failed++
-            Write-Warning "解密失败：$file — $($_.Exception.Message)"
+            $failures.Add("$file — $($_.Exception.GetBaseException().Message)")
         }
-        $index++
     }
-    if (-not $NoProgress) { Write-Progress -Id 1 -Activity '正在解密' -Completed }
-    Write-Host "处理完成：成功 $success，失败/不支持 $failed" -ForegroundColor Cyan
+    Show-Report $success $failed $decryptStopwatch.Elapsed.TotalSeconds $failures
     if ($failed) { exit 1 }
     exit 0
 } catch {
-    if (-not $NoProgress) { Write-Progress -Id 1 -Activity '正在解密' -Completed }
     Write-Warning $_.Exception.GetBaseException().Message
     exit 1
 }
