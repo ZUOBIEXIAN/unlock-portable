@@ -174,7 +174,6 @@ namespace UnlockPortable {
             Directory.CreateDirectory(parent);
             string temporary = Path.Combine(parent, "unlock_" + Guid.NewGuid().ToString("N") + "_" + Path.GetFileName(destination) + ".tmp");
             byte[] stream = null;
-            bool ready = false;
             bool committed = false;
             long plainBytes = 0;
             long originalLength = 0;
@@ -214,24 +213,27 @@ namespace UnlockPortable {
                 using (FileStream check = new FileStream(temporary, FileMode.Open, FileAccess.Read, FileShare.Read)) {
                     if (check.Length != plainBytes || Hex(sha.ComputeHash(check)) != digest) throw new IOException("Temporary output verification failed");
                 }
-                ready = true;
                 if (new FileInfo(source).Length != originalLength || File.GetLastWriteTimeUtc(source) != originalWrite) {
                     throw new IOException("Source changed before replacement");
                 }
                 if (inPlace) {
                     // Atomic replacement, not delete-then-rename. Failure preserves the source.
-                    File.Replace(temporary, source, null);
+                    FileAttributes originalAttributes = File.GetAttributes(source);
+                    bool readOnly = (originalAttributes & FileAttributes.ReadOnly) != 0;
+                    if (readOnly) File.SetAttributes(source, originalAttributes & ~FileAttributes.ReadOnly);
+                    try {
+                        File.Replace(temporary, source, null);
+                    } finally {
+                        if (readOnly && File.Exists(source)) File.SetAttributes(source, originalAttributes);
+                    }
                 } else {
                     File.Move(temporary, destination);
                 }
                 committed = true;
                 return new DecryptResult {Destination = destination, PlainBytes = plainBytes, SHA256 = digest};
-            } catch (Exception ex) {
-                if (ready && File.Exists(temporary)) throw new IOException(ex.Message + "; complete output retained at: " + temporary, ex);
-                throw;
             } finally {
                 if (stream != null) Array.Clear(stream, 0, stream.Length);
-                if (!ready && !committed && File.Exists(temporary)) {
+                if (!committed && File.Exists(temporary)) {
                     try { File.Delete(temporary); } catch { }
                 }
             }
@@ -239,6 +241,20 @@ namespace UnlockPortable {
     }
 }
 '@
+}
+
+function Invoke-WithReadablePath([string]$Path, [scriptblock]$Action) {
+    if ([IO.Path]::GetExtension($Path) -ine '.ps1') { return & $Action $Path }
+    $directory = Split-Path -Parent $Path
+    $name = Split-Path -Leaf $Path
+    $temporaryName = [IO.Path]::GetFileNameWithoutExtension($name) + '.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt'
+    Rename-Item -LiteralPath $Path -NewName $temporaryName -ErrorAction Stop
+    $temporary = Join-Path $directory $temporaryName
+    try { return & $Action $temporary }
+    finally {
+        try { Rename-Item -LiteralPath $temporary -NewName $name -ErrorAction Stop }
+        catch { Write-Warning "无法自动改回 .ps1 名称，请手动把 $temporary 改回 $name：$($_.Exception.Message)" }
+    }
 }
 
 function Find-UnlockFiles([string]$Root) {
@@ -258,7 +274,7 @@ function Find-UnlockFiles([string]$Root) {
             if ($entry.Name -match '^unlock_[0-9a-f]{32}_.+\.tmp$') { continue }
             $scanned++
             try {
-                $info = [UnlockPortable.EngineV2]::Inspect($entry.FullName)
+                $info = Invoke-WithReadablePath $entry.FullName { param($p) [UnlockPortable.EngineV2]::Inspect($p) }
                 switch ($info.Kind) {
                     'Supported' { $found.Add($entry.FullName) }
                     'Plain' { $plain++ }
@@ -297,7 +313,7 @@ try {
         Write-Host "已扫描 $($scan.Scanned) 个：匹配 $($files.Count)，普通文件 $($scan.Plain)，损坏 $($scan.Invalid)，不支持 $($scan.Unsupported)，读取失败 $($scan.Errors)，跳过链接 $($scan.Links)"
         foreach ($issue in $scan.Issues) { Write-Warning $issue }
     } else {
-        $info = [UnlockPortable.EngineV2]::Inspect($source)
+        $info = Invoke-WithReadablePath $source { param($p) [UnlockPortable.EngineV2]::Inspect($p) }
         if ($info.Kind -eq 'Plain') { Write-Host '跳过：文件没有支持的加密包头。'; exit 0 }
         if ($info.Kind -ne 'Supported') { throw "$($info.Kind)：$($info.Reason)" }
         $files.Add($source)
@@ -324,7 +340,7 @@ try {
             }
         }
         try {
-            $result = [UnlockPortable.EngineV2]::DecryptFile($file, $target, $progress)
+            $result = Invoke-WithReadablePath $file { param($p) $output = if ($target -ieq $file) { $p } else { $target }; [UnlockPortable.EngineV2]::DecryptFile($p, $output, $progress) }
             $success++
             if (-not $sourceItem.PSIsContainer) { Write-Host "已解密：$($result.Destination)（$($result.PlainBytes) 字节）" -ForegroundColor Cyan }
         } catch {
