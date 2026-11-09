@@ -4,7 +4,8 @@
     [switch]$ScanOnly,
     [switch]$Help,
     [switch]$NoProgress,
-    [switch]$Library
+    [switch]$Library,
+    [ValidateRange(1, 32)][int]$W = 4
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +17,7 @@ function Show-UnlockHelp {
   unlock "D:\资料\文件.docx"           原位解密单个文件
   unlock "D:\资料"                     递归识别并原位解密
   unlock "D:\资料" -ScanOnly           只扫描，不写入
+  unlock "D:\资料" -W 8                指定并行线程数（默认 4，范围 1-32）
   unlock "D:\资料\文件.docx" "D:\输出.docx"
   unlock "D:\资料" "D:\输出目录"      按相对路径导出匹配文件
 
@@ -258,13 +260,21 @@ namespace UnlockPortable {
             }
         }
 
-        public static ScanResult Scan(string root, Action<int> progress) {
+        public static ScanJob StartScan(string root, int workers) {
+            ScanJob job = new ScanJob();
+            job.Task = Task.Run(() => RunScan(root, workers, job));
+            return job;
+        }
+
+        static ScanResult RunScan(string root, int workers, ScanJob job) {
             ScanResult result = new ScanResult();
             Regex temporaryPattern = new Regex("^unlock_[0-9a-f]{32}_.+\\.tmp$", RegexOptions.IgnoreCase);
             Stack<string> pending = new Stack<string>();
-            int visited = 0;
+            List<string> candidates = new List<string>();
             pending.Push(root);
             while (pending.Count > 0) {
+                WaitWhilePaused();
+                if (CancelRequested) throw new OperationCanceledException("扫描已取消");
                 string directory = pending.Pop();
                 string[] entries;
                 try { entries = Directory.GetFileSystemEntries(directory); }
@@ -273,24 +283,63 @@ namespace UnlockPortable {
                     FileAttributes attributes;
                     try { attributes = File.GetAttributes(entry); }
                     catch (Exception ex) { result.Errors++; result.Issues.Add("读取失败：" + entry + " — " + ex.GetBaseException().Message); continue; }
-                    visited++;
-                    if (progress != null && visited % 50 == 0) progress(visited);
                     if ((attributes & FileAttributes.ReparsePoint) != 0) { result.Links++; continue; }
                     if ((attributes & FileAttributes.Directory) != 0) { pending.Push(entry); continue; }
                     if (temporaryPattern.IsMatch(Path.GetFileName(entry))) continue;
-                    result.Scanned++;
-                    try {
-                        HeaderInfo info = WithReadablePath(entry, p => Inspect(p));
-                        switch (info.Kind) {
-                            case "Supported": result.Files.Add(entry); break;
-                            case "Plain": result.Plain++; break;
-                            case "Invalid": result.Invalid++; result.Issues.Add("损坏或不完整：" + entry + " — " + info.Reason); break;
-                            case "Unsupported": result.Unsupported++; result.Issues.Add("暂不支持：" + entry + " — " + info.Reason); break;
-                        }
-                    } catch (Exception ex) { result.Errors++; result.Issues.Add("读取失败：" + entry + " — " + ex.GetBaseException().Message); }
+                    candidates.Add(entry);
+                }
+            }
+            job.Total = candidates.Count;
+
+            HeaderInfo[] infos = new HeaderInfo[candidates.Count];
+            string[] failures = new string[candidates.Count];
+            Parallel.For(0, candidates.Count, new ParallelOptions {MaxDegreeOfParallelism = workers}, i => {
+                WaitWhilePaused();
+                if (!CancelRequested) {
+                    try { infos[i] = WithReadablePath(candidates[i], p => Inspect(p)); }
+                    catch (Exception ex) { failures[i] = ex.GetBaseException().Message; }
+                }
+                Interlocked.Increment(ref job.Done);
+            });
+            if (CancelRequested) throw new OperationCanceledException("扫描已取消");
+
+            for (int i = 0; i < candidates.Count; i++) {
+                result.Scanned++;
+                if (failures[i] != null) { result.Errors++; result.Issues.Add("读取失败：" + candidates[i] + " — " + failures[i]); continue; }
+                switch (infos[i].Kind) {
+                    case "Supported": result.Files.Add(candidates[i]); break;
+                    case "Plain": result.Plain++; break;
+                    case "Invalid": result.Invalid++; result.Issues.Add("损坏或不完整：" + candidates[i] + " — " + infos[i].Reason); break;
+                    case "Unsupported": result.Unsupported++; result.Issues.Add("暂不支持：" + candidates[i] + " — " + infos[i].Reason); break;
                 }
             }
             return result;
+        }
+
+        public static volatile bool CancelRequested;
+
+        public static volatile bool PauseRequested;
+
+        public static void InstallCancelHandler() {
+            try { Console.TreatControlCAsInput = true; } catch { return; }
+            AppDomain.CurrentDomain.ProcessExit += (sender, args) => {
+                try { Console.TreatControlCAsInput = false; } catch { }
+            };
+        }
+
+        public static bool ConsumeCtrlC() {
+            bool pressed = false;
+            try {
+                while (Console.KeyAvailable) {
+                    ConsoleKeyInfo key = Console.ReadKey(true);
+                    if (key.Key == ConsoleKey.C && (key.Modifiers & ConsoleModifiers.Control) != 0) pressed = true;
+                }
+            } catch { return false; }
+            return pressed;
+        }
+
+        static void WaitWhilePaused() {
+            while (PauseRequested && !CancelRequested) Thread.Sleep(100);
         }
 
         public static BatchJob StartBatch(string[] sources, string[] targets, int workers) {
@@ -302,7 +351,14 @@ namespace UnlockPortable {
         static BatchResult[] DecryptBatch(string[] sources, string[] targets, int workers, BatchJob job) {
             BatchResult[] results = new BatchResult[sources.Length];
             Parallel.For(0, sources.Length, new ParallelOptions {MaxDegreeOfParallelism = workers}, i => {
+                WaitWhilePaused();
                 BatchResult item = new BatchResult {Source = sources[i]};
+                if (CancelRequested) {
+                    item.Cancelled = true;
+                    results[i] = item;
+                    Interlocked.Increment(ref job.Done);
+                    return;
+                }
                 try {
                     bool inPlace = String.Equals(sources[i], targets[i], StringComparison.OrdinalIgnoreCase);
                     DecryptResult done = WithReadablePath(sources[i], readable => DecryptFile(readable, inPlace ? readable : targets[i], null));
@@ -329,6 +385,12 @@ namespace UnlockPortable {
         public int Errors;
     }
 
+    public sealed class ScanJob {
+        public int Total;
+        public int Done;
+        public Task<ScanResult> Task;
+    }
+
     public sealed class BatchJob {
         public int Total;
         public int Done;
@@ -340,6 +402,7 @@ namespace UnlockPortable {
         public bool Ok;
         public long PlainBytes;
         public string Error;
+        public bool Cancelled;
     }
 }
 '@
@@ -371,14 +434,36 @@ function Show-Bar([string]$Label, [long]$Done, [long]$Total) {
     Write-Host (' {0,3}%  {1}/{2}          ' -f $percent, $Done, $Total) -NoNewline -ForegroundColor White
 }
 
+function Test-UnlockKeys {
+    if ([Console]::IsInputRedirected) { return }
+    if (-not [UnlockPortable.EngineV2]::ConsumeCtrlC()) { return }
+    [UnlockPortable.EngineV2]::PauseRequested = $true
+    Write-Host ''
+    while ($true) {
+        $answer = "$(Read-Host '已暂停。是否退出？(Y 退出 / N 继续)')".Trim()
+        if ($answer -ieq 'N') {
+            [UnlockPortable.EngineV2]::PauseRequested = $false
+            return
+        }
+        if ($answer -ieq 'Y') {
+            [UnlockPortable.EngineV2]::PauseRequested = $false
+            [UnlockPortable.EngineV2]::CancelRequested = $true
+            return
+        }
+        Write-Host '请输入 Y 或 N，然后按回车。' -ForegroundColor Yellow
+    }
+}
+
 function Find-UnlockFiles([string]$Root) {
-    $script:scanTotal = 0
-    try { $script:scanTotal = @([IO.Directory]::GetFiles($Root, '*', [IO.SearchOption]::AllDirectories)).Count } catch { $script:scanTotal = 0 }
-    $report = $null
-    if (-not $NoProgress) { $report = [Action[int]]{ param($n) Show-Bar '扫描' $n $script:scanTotal } }
-    $result = [UnlockPortable.EngineV2]::Scan($Root, $report)
-    if (-not $NoProgress) { Show-Bar '扫描' $script:scanTotal $script:scanTotal; Write-Host '' }
-    $result
+    $job = [UnlockPortable.EngineV2]::StartScan($Root, $W)
+    while (-not $job.Task.IsCompleted) {
+        Test-UnlockKeys
+        if (-not $NoProgress -and -not [UnlockPortable.EngineV2]::CancelRequested) { Show-Bar '扫描' $job.Done $job.Total }
+        Start-Sleep -Milliseconds 100
+    }
+    if ([UnlockPortable.EngineV2]::CancelRequested) { exit 1 }
+    if (-not $NoProgress) { Show-Bar '扫描' $job.Total $job.Total; Write-Host '' }
+    $job.Task.Result
 }
 
 function Show-Failures($Failures) {
@@ -395,6 +480,7 @@ function Show-Report([int]$Success, [int]$Failed, [double]$Seconds, $Failures) {
 if ($Library) { return }
 
 try {
+    [UnlockPortable.EngineV2]::InstallCancelHandler()
     $sourceItem = Get-Item -LiteralPath $SourcePath -Force -ErrorAction Stop
     if ($sourceItem.PSProvider.Name -ne 'FileSystem') { throw '只支持本地或网络文件系统路径。' }
     if ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '不处理符号链接或重解析点。' }
@@ -430,22 +516,35 @@ try {
             if ($destination) { $targets.Add((Join-Path $destination $file.Substring($source.TrimEnd('\').Length + 1))) }
             else { $targets.Add($file) }
         }
-        $workers = [Math]::Max(1, [Math]::Min(4, [Environment]::ProcessorCount))
+        $workers = $W
+        if ($files.Count -eq 0) {
+            Write-Host '没有需要解密的加密文件。' -ForegroundColor Cyan
+            Show-Failures $failures
+            if ($failed) { exit 1 }
+            exit 0
+        }
         $batchStopwatch = [Diagnostics.Stopwatch]::StartNew()
         $job = [UnlockPortable.EngineV2]::StartBatch([string[]]$files.ToArray(), [string[]]$targets.ToArray(), $workers)
         while (-not $job.Task.IsCompleted) {
-            if (-not $NoProgress) { Show-Bar '解密' $job.Done $job.Total }
+            Test-UnlockKeys
+            if (-not $NoProgress -and -not [UnlockPortable.EngineV2]::CancelRequested) { Show-Bar '解密' $job.Done $job.Total }
             Start-Sleep -Milliseconds 100
         }
-        if (-not $NoProgress) { Show-Bar '解密' $job.Total $job.Total; Write-Host '' }
+        if (-not $NoProgress -and -not [UnlockPortable.EngineV2]::CancelRequested) {
+            Show-Bar '解密' $job.Total $job.Total
+            Write-Host ''
+        }
         $outcomes = $job.Task.Result
         $success = 0
+        $skipped = 0
         foreach ($outcome in $outcomes) {
-            if ($outcome.Ok) { $success++ }
+            if ($outcome.Cancelled) { $skipped++ }
+            elseif ($outcome.Ok) { $success++ }
             else { $failed++; $failures.Add("$($outcome.Source) — $($outcome.Error)") }
         }
         Show-Report $success $failed $batchStopwatch.Elapsed.TotalSeconds $failures
-        if ($failed) { exit 1 }
+        if ($skipped) { Write-Host "已取消：未处理 $skipped 个文件（正在处理的文件已完整结束，原文件状态正常）" -ForegroundColor Yellow }
+        if ($failed -or $skipped) { exit 1 }
         exit 0
     }
     $success = 0
@@ -472,6 +571,10 @@ try {
     if ($failed) { exit 1 }
     exit 0
 } catch {
+    if ($_.Exception.GetBaseException() -is [OperationCanceledException]) {
+        Write-Host '已取消：扫描已停止，没有修改任何文件。' -ForegroundColor Yellow
+        exit 1
+    }
     Write-Warning $_.Exception.GetBaseException().Message
     exit 1
 }
