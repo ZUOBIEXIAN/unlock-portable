@@ -56,8 +56,11 @@ PowerShell 通过系统自带 Add-Type/.NET 在内存编译计算逻辑，无需
 bin\unlock.cmd        命令入口
 bin\unlock-core.ps1   全部识别与解密逻辑
 setup\install.ps1     安装和用户 PATH 配置
+desktop\README.txt   桌面版目录与构建说明
 
 更新时替换 bin 中的两个文件，再双击安装.bat 即可。
+
+桌面版见 desktop\README.txt。
 
 六、从旧版迁移（先把新版 unlock-portable 文件夹放到桌面）
 在 PowerShell 中完整执行：

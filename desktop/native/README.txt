@@ -1,13 +1,11 @@
 Unlock Portable Native
 
-This is a separate native Win32 build. The managed build is in ..\managed\release\UnlockPortable.exe.
+Native 版
 
-Build with PowerShell:
-  .\build.ps1
+构建：运行 .\build.ps1
+发布：release\UnlockPortable-Native.exe
+自测：release\UnlockPortable-Native.exe --self-test <加密文件> <对应明文>
 
-The resulting executable is written to:
-  .\release\UnlockPortable-Native.exe
-
-It uses Windows system APIs and BCrypt SHA-256, with the MinGW runtime statically linked.
-The self-test accepts the same encrypted input and expected plaintext paths as the managed build:
-  UnlockPortable-Native.exe --self-test <encrypted-file> <expected-plaintext>
+启动打开面板。设置按钮配置点 X 时隐藏到托盘或退出；首次关闭会询问。托盘“退出”始终直接退出。
+面板任务使用面板进度条；托盘任务显示右下角进度窗，完成 8 秒后关闭。
+图标嵌入 EXE，用于托盘和窗口标题栏。设置保存在 %APPDATA%\UnlockPortable。
