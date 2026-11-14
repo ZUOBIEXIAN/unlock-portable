@@ -29,6 +29,7 @@ internal sealed class MainForm : Form
     private readonly Button cancelButton = new();
     private readonly ProgressBar progress = new();
     private readonly Label status = new();
+    private readonly ListView results = new();
     private bool allowClose;
     private readonly Func<bool, Task> workRequested;
     private readonly Action cancelRequested;
@@ -85,7 +86,16 @@ internal sealed class MainForm : Form
         cancelButton.Click += (_, _) => this.cancelRequested();
         Controls.AddRange([scanButton, decryptButton, cancelButton]);
 
-        var footer = new Panel { Location = new Point(26, 310), Size = new Size(848, 42), BackColor = Color.Transparent };
+        results.SetBounds(28, 282, 844, 294);
+        results.View = View.Details;
+        results.FullRowSelect = true;
+        results.GridLines = true;
+        results.Columns.Add("文件", 420);
+        results.Columns.Add("状态", 110);
+        results.Columns.Add("信息", 290);
+        Controls.Add(results);
+
+        var footer = new Panel { Location = new Point(26, 590), Size = new Size(848, 42), BackColor = Color.Transparent };
         status.SetBounds(0, 0, 840, 20); status.ForeColor = Color.FromArgb(76, 98, 108); status.Text = "选择文件或文件夹开始。";
         progress.SetBounds(0, 25, 848, 10); progress.Style = ProgressBarStyle.Continuous;
         footer.Controls.AddRange([status, progress]);
@@ -114,6 +124,17 @@ internal sealed class MainForm : Form
     }
 
     public string SelectedPath => pathBox.Text;
+
+    public void ClearResults() => results.Items.Clear();
+
+    public void AddResult(string path, string state, string detail)
+    {
+        var item = new ListViewItem(path);
+        item.SubItems.Add(state);
+        item.SubItems.Add(detail);
+        results.Items.Add(item);
+        item.EnsureVisible();
+    }
 
     public void Shutdown()
     {
@@ -323,6 +344,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         cancellation.Dispose();
         cancellation = new CancellationTokenSource();
         progressForm.BeginTask(decrypt ? "正在扫描并解密" : "正在扫描", false);
+        mainForm.ClearResults();
         bool showTrayProgress = !mainForm.Visible;
         if (showTrayProgress) progressForm.ShowProgress();
         else progressForm.HideProgress();
@@ -372,6 +394,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             foreach (string file in matches)
             {
                 cancellation.Token.ThrowIfCancellationRequested();
+                bool decrypted = false;
                 try
                 {
                     int completedBefore = done;
@@ -382,8 +405,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
                         BeginInvokeOnUi(() => PublishState(overall, $"解密中：{completedBefore + 1:N0}/{matches.Count:N0} · {filePercent}%", true));
                     }), cancellation.Token);
                     succeeded++;
+                    decrypted = true;
                 }
-                catch (Exception ex) when (ex is not OperationCanceledException) { failed++; }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    failed++;
+                    mainForm.AddResult(file, "失败", ex.GetBaseException().Message);
+                }
+                if (decrypted)
+                    mainForm.AddResult(file, "已解密", "已验证并原位替换");
                 done++;
                 int overallProgress = Math.Clamp(50 + (int)(50.0 * done / matches.Count), 0, 100);
                 PublishState(overallProgress, $"解密中：{done:N0}/{matches.Count:N0} · 成功 {succeeded:N0} · 失败 {failed:N0}", true);
