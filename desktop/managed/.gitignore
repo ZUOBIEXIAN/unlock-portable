@@ -2,4 +2,5 @@ bin/
 obj/
 dist/
 *.exe
+!release/UnlockPortable.exe
 *.pdb
